@@ -42,12 +42,11 @@
     };
 
     var _setLineImage = function(id, imageUrl) {
-        var imageQuery = $jobj(id).attr('src', imageUrl);
-        if(imageUrl.indexOf(".png") > -1) $ax.utils.fixPng(imageQuery[0]);
+        $jobj(id).attr('src', imageUrl);
     };
 
     var _switchView = function (viewId, forceSwitchTo) {
-        if(!$ax.pageData.isAdaptiveEnabled) return;
+        //if(!$ax.pageData.isAdaptiveEnabled) return;
 
         var previousViewId = $ax.adaptive.currentViewId;
         if(typeof previousViewId == 'undefined') previousViewId = '';
@@ -67,23 +66,25 @@
             query.expanded(defaultExpanded);
         });
 
-        // reset all the positioning on the style tags, including size and transformation
-        $axure('*').each(function(diagramObject, elementId) {
+        // reset all the inline positioning from move and rotate actions including size and transformation
+        $axure('*').each(function (diagramObject, elementId) {
+            if(diagramObject.isContained) return;
+            if($ax.getParentRepeaterFromElementIdExcludeSelf(elementId)) return;
+
             var element = document.getElementById(elementId);
-            if(element && !diagramObject.isContained) {
+            if(element) {
                 var resetCss = {
                     top: "", left: "", width: "", height: "", opacity: "",
                     transform: "", webkitTransform: "", MozTransform: "", msTransform: "", OTransform: ""
                 };
                 var query = $(element);
-                var children = query.children();
-                var sketchyImage = $('#' + $ax.repeater.applySuffixToElementId(elementId, '_image_sketch'));
-                var textChildren = query.children('div.text');
-
                 query.css(resetCss);
-                if(children) children.css(resetCss);
-                if(sketchyImage) sketchyImage.css(resetCss);
-                if(textChildren) textChildren.css(resetCss);
+                var isPanel = $ax.public.fn.IsDynamicPanel(diagramObject.type);
+                if(!isPanel || diagramObject.fitToContent) { //keeps size on the panel states when switching adaptive views to optimize fit to panel
+                    if(diagramObject.fitToContent) $ax.dynamicPanelManager.setFitToContentCss(elementId, true);
+                    var children = query.children();
+                    if(children.length) children.css(resetCss);
+                }
 
                 $ax.dynamicPanelManager.resetFixedPanel(diagramObject, element);
                 $ax.dynamicPanelManager.resetAdaptivePercentPanel(diagramObject, element);
@@ -98,14 +99,19 @@
             $ax.style.reselectElements();
         }
 
-        $axure('*').each(function(obj, elementId) {
+        $axure('*').each(function (obj, elementId) {
+            if($ax.getParentRepeaterFromElementIdExcludeSelf(elementId)) return;
+
             $ax.style.updateElementIdImageStyle(elementId); // When image override exists, fix styling/borders
         });
 
+        //$ax.style.startSuspendTextAlignment();
+
         // reset all the images only if we're going back to the default view
         if(!viewId) {
-            _updateInputVisibility('', $axure('*'));
-            $axure('*').each(function(diagramObject, elementId) {
+            $axure('*').each(function (diagramObject, elementId) {
+                if($ax.getParentRepeaterFromElementIdExcludeSelf(elementId)) return;
+
                 $ax.placeholderManager.refreshPlaceholder(elementId);
 
                 var images = diagramObject.images;
@@ -131,35 +137,44 @@
                             if(selectedImage) $ax.style.applyImage(elementId, selectedImage, 'selected');
                             return;
                         }
-                        $ax.style.applyImage(elementId, _getImageWithTag(images, 'normal~'));
+                        $ax.style.applyImage(elementId, _getImageWithTag(images, 'normal~'), 'normal');
                     } else {
                         if ($ax.style.IsWidgetDisabled(elementId)) {
-                            var disabledImage = $ax.style.getElementImageOverride(elementId, 'disabled') || images['disabled~'];
+                            var disabledImage = _matchImage(elementId, images, [], 'disabled', true);                            
                             if (disabledImage) $ax.style.applyImage(elementId, disabledImage, 'disabled');
                             return;
                         }
                         if ($ax.style.IsWidgetSelected(elementId)) {
-                            var selectedImage = $ax.style.getElementImageOverride(elementId, 'selected') || images['selected~'];
+                            var selectedImage = _matchImage(elementId, images, [], 'selected', true);  
                             if (selectedImage) $ax.style.applyImage(elementId, selectedImage, 'selected');
                             return;
                         }
-                        $ax.style.applyImage(elementId, $ax.style.getElementImageOverride(elementId, 'normal') || images['normal~']);
+                        var normalImage = _matchImage(elementId, images, [], 'normal', true);  
+                        $ax.style.applyImage(elementId, normalImage, 'normal');
                     }
                 }
 
+                //align all text
                 var child = $jobj(elementId).children('.text');
                 if(child.length) $ax.style.transformTextWithVerticalAlignment(child[0].id, function() { });
             });
             // we have to reset visibility if we aren't applying a new view
             $ax.visibility.resetLimboAndHiddenToDefaults();
+            $ax.visibility.clearMovedAndResized();
             $ax.repeater.refreshAllRepeaters();
-            $ax.dynamicPanelManager.updateAllFitPanels();
+            $ax.dynamicPanelManager.updateParentsOfNonDefaultFitPanels();
             $ax.dynamicPanelManager.updatePercentPanelCache($ax('*'));
         } else {
             $ax.visibility.clearLimboAndHidden();
+            $ax.visibility.clearMovedAndResized();
             _applyView(viewId);
             $ax.repeater.refreshAllRepeaters();
+            $ax.dynamicPanelManager.updateAllLayerSizeCaches();
+            $ax.dynamicPanelManager.updateParentsOfNonDefaultFitPanels();
         }
+
+        $ax.annotation.updateAllFootnotes();
+        //$ax.style.resumeSuspendTextAlignment();
 
         $ax.adaptive.triggerEvent('viewChanged', {});
         if(_loadFinished) $ax.viewChangePageAndMasters(forceSwitchTo);
@@ -174,43 +189,6 @@
         return flattened;
     }
 
-    // gets if input is hidden due to sketch
-    var BORDER_WIDTH = "borderWidth";
-    var COLOR_STYLE = "colorStyle";
-    var SKETCH_FACTOR = "sketchFactor";
-    var _areInputsHidden = function(viewId) {
-        var chain = _getAdaptiveIdChain(viewId);
-        var page = $ax.pageData.page;
-        var adaptiveStyles = page.adaptiveStyles;
-        // keep track of props that are not sketchy, as you continue to climb up your parents;
-        var notSketch = [];
-        for(var i = chain.length - 1; i >= -1; i--) {
-            var style = i == -1 ? page.style : adaptiveStyles[chain[i]];
-            if(notSketch.indexOf(BORDER_WIDTH) == -1 && style.hasOwnProperty(BORDER_WIDTH)) {
-                if(style[BORDER_WIDTH] != 0) return true;
-                notSketch.push(BORDER_WIDTH);
-            }
-            if(notSketch.indexOf(COLOR_STYLE) == -1 && style.hasOwnProperty(COLOR_STYLE)) {
-                if(style[COLOR_STYLE] != 'appliedColor') return true;
-                notSketch.push(COLOR_STYLE);
-            }
-            if(notSketch.indexOf(SKETCH_FACTOR) == -1 && style.hasOwnProperty(SKETCH_FACTOR)) {
-                if(style[SKETCH_FACTOR] != 0) return true;
-                notSketch.push(SKETCH_FACTOR);
-            }
-        }
-        return false;
-    };
-
-    var _updateInputVisibility = function(viewId, query) {
-        var func = _areInputsHidden(viewId) ? 'addClass' : 'removeClass';
-        query.each(function(obj, elementId) {
-            var input = $jobj($ax.repeater.applySuffixToElementId(elementId, '_input'));
-            if(input.length == 0) return;
-            input[func]('form_sketch');
-        });
-    };
-
     // gets the inheritance chain of a particular view.
     var _getAdaptiveIdChain = $ax.adaptive.getAdaptiveIdChain = function(viewId) {
         if(!viewId) return [];
@@ -220,6 +198,31 @@
         while(current) {
             chain[chain.length] = current.id;
             current = _idToView[current.baseViewId];
+        }
+        return chain.reverse();
+    };
+
+    var _getMasterAdaptiveIdChain = $ax.adaptive.getMasterAdaptiveIdChain = function (masterId, viewId) {
+        if (!viewId) return [];
+
+        var master = $ax.pageData.masters[masterId];
+        var masterViews = master.adaptiveViews;
+        var idToMasterView = {};
+        if (masterViews && masterViews.length > 0) {
+            for (var i = 0; i < masterViews.length; i++) {
+                var view = masterViews[i];
+                idToMasterView[view.id] = view;
+            }
+        }
+
+        if (!idToMasterView) return [];
+
+        var view = idToMasterView[viewId];
+        var chain = [];
+        var current = view;
+        while (current) {
+            chain[chain.length] = current.id;
+            current = idToMasterView[current.baseViewId];
         }
         return chain.reverse();
     };
@@ -276,7 +279,6 @@
             query = $ax('*');
         }
         jquery.addClass(viewId);
-        _updateInputVisibility(viewId, query);
         var viewIdChain = _getAdaptiveIdChain(viewId);
         // this could be made more efficient by computing it only once per object
         query.each(function(diagramObject, elementId) {
@@ -284,7 +286,7 @@
         });
 
         $ax.visibility.addLimboAndHiddenIds(limboIds, hiddenIds, query);
-        $ax.dynamicPanelManager.updateAllFitPanels();
+        //$ax.dynamicPanelManager.updateAllFitPanelsAndLayerSizeCaches();
         $ax.dynamicPanelManager.updatePercentPanelCache(query);
     };
 
@@ -315,16 +317,6 @@
                 var imgUrl = _matchImage(elementId, images, viewIdChain, state);
                 if(imgUrl) $ax.style.applyImage(elementId, imgUrl, state);
             }
-            //                for(var i = viewIdChain.length - 1; i >= 0; i--) {
-            //                    var viewId = viewIdChain[i];
-            //                    var imgUrl = $ax.style.getElementImageOverride(elementId, state) || images[state + '~' + viewId] || images['normal~' + viewId];
-            //                    if(imgUrl) {
-            //                        $ax.style.applyImage(elementId, imgUrl, state);
-            //                        break;
-            //                    }
-            //                }
-
-            //            }
         }
         // addaptive override style (not including default style props)
         var adaptiveStyle = $ax.style.computeAllOverrides(elementId, undefined, state, viewId);
@@ -332,7 +324,6 @@
         // this style INCLUDES the object's my style
         var compoundStyle = $.extend({}, diagramObject.style, adaptiveStyle);
 
-        //$ax.style.setAdaptiveStyle(elementId, adaptiveStyle);
         if(!diagramObject.isContained) {
             $ax.style.setAdaptiveStyle(elementId, adaptiveStyle);
         }
@@ -343,7 +334,7 @@
         if(compoundStyle.visible === false) hiddenIds[scriptId] = true;
     };
 
-    var _matchImage = function(id, images, viewIdChain, state) {
+    var _matchImage = function(id, images, viewIdChain, state, doNotProgress) {
         var override = $ax.style.getElementImageOverride(id, state);
         if(override) return override;
 
@@ -352,12 +343,16 @@
         // first check all the images for this state
         for(var i = viewIdChain.length - 1; i >= 0; i--) {
             var viewId = viewIdChain[i];
-            var img = images[state + "~" + viewId];
+            var img = images[id + "~" + state + "~" + viewId];
+            if(!img) img = images[state + "~" + viewId];
             if(img) return img;
         }
         // check for the default state style
-        var defaultStateImage = images[state + '~'];
+        var defaultStateImage = images[id + "~" + state + "~"];
+        if(!defaultStateImage) defaultStateImage = images[state + "~"];
         if(defaultStateImage) return defaultStateImage;
+
+        if(doNotProgress) return undefined;
 
         state = $ax.style.progessState(state);
         if(state) return _matchImage(id, images, viewIdChain, state);
@@ -399,38 +394,40 @@
             return width1 < width2 || (width1 == width2 && height1 < height2);
         };
 
-        var _isWindowGreaterThanView = function(view, width, height) {
-            return width >= view.size.width && height >= view.size.height;
+        var _isWindowWidthGreaterThanViewWidth = function(view, width) {
+            return width >= view.size.width;
         };
 
-        var _isWindowLessThanView = function(view1, width, height) {
+        var _isWindowWidthLessThanViewWidth = function(view1, width) {
             var viewWidth = view1.size.width || 1000000;
-            var viewHeight = view1.size.height || 1000000;
 
-            return width <= viewWidth && height <= viewHeight;
+            return width <= viewWidth;
         };
 
         var greater = undefined;
         var less = undefined;
 
+        var defaultView = $ax.pageData.defaultAdaptiveView;
+        if (_isWindowWidthGreaterThanViewWidth(defaultView, winWidth, winHeight)) greater = defaultView;
+        less = defaultView;
         for(var i = 0; i < _enabledViews.length; i++) {
             var view = _enabledViews[i];
-            if(view.condition == ">=") {
-                if(_isWindowGreaterThanView(view, winWidth, winHeight)) {
-                    if(!greater || _isViewOneGreaterThanTwo(view, greater)) greater = view;
-                }
-            } else {
-                if(_isWindowLessThanView(view, winWidth, winHeight)) {
-                    if(!less || _isViewOneLessThanTwo(view, less)) less = view;
-                }
+            if(_isWindowWidthGreaterThanViewWidth(view, winWidth, winHeight)) {
+                if(!greater || _isViewOneGreaterThanTwo(view, greater)) greater = view;
+            }
+            if(_isWindowWidthLessThanViewWidth(view, winWidth, winHeight)) {
+                if(!less || _isViewOneLessThanTwo(view, less)) less = view;
             }
         }
-        return less || greater;
+        return greater || less;
+
+        //return less || greater;
     };
 
     var _isAdaptiveInitialized = function() {
         return typeof _idToView != 'undefined';
     };
+
 
     $ax.messageCenter.addMessageListener(function(message, data) {
         //If the adaptive plugin hasn't been initialized yet then 
@@ -451,8 +448,182 @@
             if(!_isAdaptiveInitialized()) {
                 _initialViewSizeToLoad = data;
             } else _handleSetViewForSize(data.width, data.height);
+        } else if(message == 'setScale') {
+            var prevScaleN = $('#base').css('transform');
+            (prevScaleN === "none") ? prevScaleN = 1 : prevScaleN = Number(prevScaleN.substring(prevScaleN.indexOf('(') + 1, prevScaleN.indexOf(',')));
+            var newScaleN = 1;
+            var contentOriginOffset = 0;
+
+            //1 Scale to Width
+            //2 Scale to Fit
+            $('#base').css({
+                'transform': '',
+                'transform-origin': ''
+            });
+            $('body').css('left', '');
+            $('body').css('background-size', '');
+            // IOS hack to get rid of tap highlight on blank pages
+            //if (IOS && !($('body').css('position') == 'relative')) $('body').css('width', window.screen.width + 'px');
+            //else $('body').css('width', '');
+            $('body').css('width', '');
+            $('body').css('height', '');
+            $('body').css('overflow', '');
+            $('body').css('overflow-x', '');
+
+            if(data.scale == 1 || data.scale == 2) {
+                var $body = $('body');
+                var bodyWidth = $body.width();
+                if (MOBILE_DEVICE) {
+                    bodyWidth = data.viewportWidth > 0 ? data.viewportWidth : $(document).width(); 
+                }
+                var isCentered = $body.css('position') == 'relative';
+                var origin = newOrigin = isCentered ? -Number($body.css('left').replace('px', '')) + bodyWidth / 2 + 'px top' : 'left top';
+                $(window).scrollLeft(0);
+                $body.css('overflow-x', 'hidden');
+
+                // screen width does not adjust on screen rotation for iOS (width is always shorter screen measurement)
+                var isLandscape = window.orientation != 0 && window.orientation != 180;
+                var mobileWidth = (IOS ? (isLandscape ? window.screen.height : window.screen.width) : window.screen.width) - data.panelWidthOffset;
+                var scaleN = newScaleN = (MOBILE_DEVICE ? mobileWidth : $(window).width()) / bodyWidth;
+                if (data.scale == 2) {
+                    $(window).scrollTop(0);
+                    $body.css('overflow', 'hidden');
+                    var pageSize = $ax.public.fn.getPageSize();
+                    var hScaleN = (MOBILE_DEVICE ? data.viewportHeight : $(window).height()) / Math.max(1, pageSize.bottom);
+                    if (hScaleN < scaleN) {
+                        scaleN = newScaleN = hScaleN;
+                        //$body.css('height', $body.height() * scaleN + 'px');
+                    }
+                    if (isCentered) contentOriginOffset = scaleN * (bodyWidth / 2);
+                }
+                // Setting body height all the time instead of just when scaling to height for scale to fit, since IE won't scale properly without it
+                $body.css('height', $body.height() * scaleN + 'px');
+
+                var scale = 'scale(' + scaleN + ')';
+
+                $('#base').css({
+                    'transform': scale,
+                    'transform-origin': origin
+                });
+
+                var bodyBg = $('body').css('background-image');
+                if(bodyBg && bodyBg != 'none') {
+                    $('body').css('background-size', '');
+                    var bodyBgSize = $('body').css('background-size');
+                    var bodyBgDim = bodyBgSize.split(' ');
+                    var bodyBgWidth = Number(bodyBgDim[0].replace('px', '')) * scaleN + 'px';
+                    var bodyBgHeight = Number(bodyBgDim[1].replace('px', '')) * scaleN + 'px';
+                    $('body').css('background-size', bodyBgWidth + ' ' + bodyBgHeight);
+                }
+
+                if(isCentered && scaleN < 1) {
+                    var oldLeft = -Number($body.css('left').replace('px', ''));
+                    var newLeft = bodyWidth / 2 * (1 - scaleN) + oldLeft;
+                    // IOS hack to get rid of tap highlight on centered pages that are scaled
+                    if (IOS) newLeft = newLeft - 1;
+                    $body.css('left', '-' + (newLeft) + 'px');
+
+                    $body.css('width', bodyWidth * scaleN + 'px');
+                } else if (!isCentered) {
+                    // TODO: may want this back
+                    $body.css('width', bodyWidth * scaleN + 'px');
+                }
+            } else if (IOS && !($('body').css('position') == 'relative')) {
+                // IOS hack to get rid of tap highlight on blank pages
+                $('body').css('width', (window.screen.width - data.panelWidthOffset) + 'px');
+            }
+
+            var contentScale = {
+                scaleN: newScaleN,
+                prevScaleN: prevScaleN,
+                contentOriginOffset: contentOriginOffset,
+            };
+            $axure.messageCenter.postMessage('setContentScale', contentScale);
+
+        } else if(message == 'setDeviceMode') {
+            if (data.device) {
+                // FIXES firefox cursor not staying outside initial device frame border
+                // SAFARI needs entire content height so that trackpad can be disabled
+                if (FIREFOX || SAFARI) {
+                    var pageSize = $ax.public.fn.getPageSize();
+                    $('html').css('height', pageSize.bottom + 'px');
+                }
+
+                //if (SAFARI) _setTrackpadHorizontalScroll(false);
+
+                if ($('html').getNiceScroll().length == 0 && !MOBILE_DEVICE) {// || !$axure.player.isMobileMode())) {
+                //if ($('html').getNiceScroll().length == 0) {
+                    $('html').scrollLeft(0);
+
+                    if (!SAFARI) $('html').niceScroll({ emulatetouch: true, horizrailenabled: false });
+                    $('html').addClass('mobileFrameCursor');
+                    $('html').css('cursor', 'url(resources/css/images/touch.cur), auto');
+                    $('html').css('cursor', 'url(resources/css/images/touch.svg) 32 32, auto');
+                    $('html').css('overflow-x', 'hidden');
+                    //$('html').getNiceScroll().locked = true;
+                    if (IE) {
+                        document.addEventListener("click", function () {
+                            // IE still sometimes wants an argument here
+                            this.activeElement.releasePointerCapture();
+                        }, false);
+                    }
+
+                    if ($axure.browser.isEdge) {
+                        document.addEventListener("pointerdown", function (e) {
+                            this.activeElement.releasePointerCapture(e.pointerId);
+                        }, false);
+                    }
+
+                    $ax.dynamicPanelManager.initMobileScroll();
+                } else {
+                    // Gives horizontal scroll to android in 100% (handled outside of iframe)
+                    $('html').css('overflow-x', 'hidden');
+                    $('body').css('margin', '0px');
+                    $(function () { _setHorizontalScroll(false); });
+                }
+            } else {
+                //if (SAFARI) _setTrackpadHorizontalScroll(true);
+
+                if (!SAFARI) $('html').getNiceScroll().remove();
+                $('html').css('overflow-x', '');
+                $('html').css('cursor', '');
+                $('html').removeAttr('style');
+                //$('html').scrollLeft(0);
+                $('body').css('margin', '');
+                $('html').removeClass('mobileFrameCursor');
+                $(function () { _setHorizontalScroll(!data.scaleToWidth); });
+            }
         }
     });
+
+    var _setTrackpadHorizontalScroll = function (active) {
+        var preventScroll = function (e) {
+            if (Math.abs(e.wheelDeltaX) != 0) {
+                e.preventDefault();
+            }
+        }
+
+        if (!active) {
+            document.body.addEventListener("mousewheel", preventScroll, { passive: false });
+            document.getElementById('html').addEventListener("mousewheel", preventScroll, { passive: false });
+        } else {
+            document.body.removeEventListener("mousewheel", preventScroll, { passive: false });
+            document.getElementById('html').removeEventListener("mousewheel", preventScroll, { passive: false });
+        }
+    }
+
+    var _setHorizontalScroll = function (active) {
+        var $body = $(document);
+        if (!active) {
+            $body.bind('scroll', function () {
+                if ($body.scrollLeft() !== 0) {
+                    $body.scrollLeft(0);
+                }
+            });
+        } else {
+            $body.unbind('scroll');
+        }
+    }
 
     $ax.adaptive.setAdaptiveView = function(view) {
         var viewIdForSitemapToUnderstand = view == 'auto' ? undefined : (view == 'default' ? '' : view);
@@ -463,18 +634,16 @@
     };
 
     $ax.adaptive.initialize = function() {
-        _views = $ax.document.adaptiveViews;
+        _views = $ax.pageData.adaptiveViews;
         _idToView = {};
+
+        var useViews = $ax.document.configuration.useViews;
 
         if(_views && _views.length > 0) {
             for(var i = 0; i < _views.length; i++) {
                 var view = _views[i];
                 _idToView[view.id] = view;
-            }
-
-            var enabledViewIds = $ax.document.configuration.enabledViewIds;
-            for(var i = 0; i < enabledViewIds.length; i++) {
-                _enabledViews[_enabledViews.length] = _idToView[enabledViewIds[i]];
+                if(useViews) _enabledViews[_enabledViews.length] = view;
             }
 
             if(_autoIsHandledBySidebar && _initialViewSizeToLoad) _handleSetViewForSize(_initialViewSizeToLoad.width, _initialViewSizeToLoad.height);
@@ -498,10 +667,12 @@
     };
 
     var _handleSetViewForSize = function (width, height) {
-        if(!_auto) return;
-
         var toView = _getAdaptiveView(width, height);
         var toViewId = toView && toView.id;
         _switchView(toViewId);
     };
+
+    $ax.adaptive.getSketchKey = function() {
+        return $ax.pageData.sketchKeys[$ax.adaptive.currentViewId || ''];
+    }
 });
